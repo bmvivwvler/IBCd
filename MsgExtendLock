@@ -1,0 +1,149 @@
+package ibc
+
+import (
+	"fmt"
+	"time"
+
+	sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// LockedAsset represents a locked asset on the Cosmos chain
+type LockedAsset struct {
+	Owner     sdk.AccAddress `json:"owner"`
+	Amount    sdk.Coin       `json:"amount"`
+	EvmChain  string         `json:"evm_chain"`
+	LockTime  time.Time      `json:"lock_time"`
+	LockHours int64          `json:"lock_hours"`
+}
+
+// MsgLockAsset defines the LockAsset message
+type MsgLockAsset struct {
+	Sender    sdk.AccAddress `json:"sender"`
+	Amount    sdk.Coin       `json:"amount"`
+	EvmChain  string         `json:"evm_chain"`
+	LockHours int64          `json:"lock_hours"`
+}
+
+// MsgUnlockAsset defines the UnlockAsset message
+type MsgUnlockAsset struct {
+	Owner    sdk.AccAddress `json:"owner"`
+	EvmChain string         `json:"evm_chain"`
+}
+
+// MsgExtendLock defines the ExtendLock message
+type MsgExtendLock struct {
+	Owner     sdk.AccAddress `json:"owner"`
+	EvmChain  string         `json:"evm_chain"`
+	LockHours int64          `json:"lock_hours"`
+}
+
+// MsgQueryLockedAssets defines the QueryLockedAssets message
+type MsgQueryLockedAssets struct {
+	EvmChain string `json:"evm_chain"`
+}
+
+// HandleMsgLockAsset handles the LockAsset message
+func HandleMsgLockAsset(ctx sdk.Context, k Keeper, msg MsgLockAsset) sdk.Result {
+	// Deduct the asset from the sender's account
+	err := k.bankKeeper.SendCoins(ctx, msg.Sender, sdk.AccAddress{}, sdk.Coins{msg.Amount})
+	if err != nil {
+		return err.Result()
+	}
+
+	// Store the locked asset information
+	lockTime := ctx.BlockTime()
+	lockEndTime := lockTime.Add(time.Duration(msg.LockHours) * time.Hour)
+
+	lockedAsset := LockedAsset{
+		Owner:     msg.Sender,
+		Amount:    msg.Amount,
+		EvmChain:  msg.EvmChain,
+		LockTime:  lockTime,
+		LockHours: msg.LockHours,
+	}
+	k.SetLockedAsset(ctx, lockedAsset)
+
+	// Schedule an unlock operation after the lock period
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			EventTypeUnlock,
+			sdk.NewAttribute(AttributeKeyOwner, msg.Sender.String()),
+			sdk.NewAttribute(AttributeKeyEvmChain, msg.EvmChain),
+			sdk.NewAttribute(AttributeKeyUnlockTime, lockEndTime.String()),
+		),
+	)
+	ctx.ScheduleAfter(time.Duration(msg.LockHours)*time.Hour, sdk.NewMsgUnlockAsset(msg.Sender, msg.EvmChain))
+
+	return sdk.Result{Code: sdk.CodeOK}
+}
+
+// HandleMsgUnlockAsset handles the UnlockAsset message
+func HandleMsgUnlockAsset(ctx sdk.Context, k Keeper, msg MsgUnlockAsset) sdk.Result {
+	// Retrieve the locked asset information
+	lockedAsset, found := k.GetLockedAsset(ctx, msg.Owner, msg.EvmChain)
+	if !found {
+		return sdk.ErrUnknownRequest(fmt.Sprintf("locked asset not found for owner %s on EVM chain %s", msg.Owner, msg.EvmChain)).Result()
+	}
+
+	// Check if the unlock time has arrived
+	if ctx.BlockTime().Before(lockedAsset.LockTime.Add(time.Duration(lockedAsset.LockHours) * time.Hour)) {
+		return sdk.ErrInvalidRequest("unlock time has not arrived yet").Result()
+	}
+
+	// Transfer the locked asset back to the owner
+	err := k.bankKeeper.SendCoins(ctx, sdk.AccAddress{}, msg.Owner, sdk.Coins{lockedAsset.Amount})
+	if err != nil {
+		return err.Result()
+	}
+
+	// Remove the locked asset record
+	k.DeleteLockedAsset(ctx, lockedAsset)
+
+	return sdk.Result{Code: sdk.CodeOK}
+}
+
+// HandleMsgExtendLock handles the ExtendLock message
+func HandleMsgExtendLock(ctx sdk.Context, k Keeper, msg MsgExtendLock) sdk.Result {
+	// Retrieve the locked asset information
+	lockedAsset, found := k.GetLockedAsset(ctx, msg.Owner, msg.EvmChain)
+	if !found {
+		return sdk.ErrUnknownRequest(fmt.Sprintf("locked asset not found for owner %s on EVM chain %s", msg.Owner, msg.EvmChain)).Result()
+	}
+
+	// Check if the lock has already expired
+	if ctx.BlockTime().After(lockedAsset.LockTime.Add(time.Duration(lockedAsset.LockHours) * time.Hour)) {
+		return sdk.ErrInvalidRequest("lock has already expired, cannot extend").Result()
+	}
+
+	// Extend the lock time
+	lockedAsset.LockTime = ctx.BlockTime()
+	lockedAsset.LockHours += msg.LockHours
+	k.SetLockedAsset(ctx, lockedAsset)
+
+	// Schedule an unlock operation after the new lock period
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			EventTypeUnlock,
+			sdk.NewAttribute(AttributeKeyOwner, msg.Owner.String()),
+			sdk.NewAttribute(AttributeKeyEvmChain, msg.EvmChain),
+			sdk.NewAttribute(AttributeKeyUnlockTime, lockedAsset.LockTime.Add(time.Duration(lockedAsset.LockHours)*time.Hour).String()),
+		),
+	)
+	ctx.ScheduleAfter(time.Duration(msg.LockHours)*time.Hour, sdk.NewMsgUnlockAsset(msg.Owner, msg.EvmChain))
+
+	return sdk.Result{Code: sdk.CodeOK}
+}
+
+// HandleMsgQueryLockedAssets handles the QueryLockedAssets message
+func HandleMsgQueryLockedAssets(ctx sdk.Context, k Keeper, msg MsgQueryLockedAssets) sdk.Result {
+	lockedAssets := k.GetLockedAssetsByEvmChain(ctx, msg.EvmChain)
+	bz, err := codec.MarshalJSONIndent(k.cdc, lockedAssets)
+	if err != nil {
+		return sdk.ErrInternal("failed to marshal JSON").Result()
+	}
+
+	return sdk.Result{
+		Code: sdk.CodeOK,
+		Data: bz,
+	}
+}
